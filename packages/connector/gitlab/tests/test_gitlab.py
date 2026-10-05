@@ -14,6 +14,8 @@ no live token, no model download — so these run in CI. Coverage:
   - items that vanish from the sweep become hard-delete markers
   - an empty sweep does not mass-delete and preserves state
   - non-system comments are folded into the item text; system notes are not
+  - one document is capped: comments beyond the cap are dropped with a count,
+    the description is truncated with a marker, and the result is deterministic
   - merge requests use their own table and carry branch info
   - the source declares the cognee document marker and merge + hard_delete
   - configuration comes from environment variables
@@ -347,6 +349,45 @@ def test_render_content_is_stable_across_updated_at_changes():
     assert _render_content(a, "Issue", []) == _render_content(b, "Issue", [])
 
 
+def test_content_cap_drops_trailing_comments_with_a_count_and_is_deterministic():
+    item = _item(1, iid=7, updated="2026-01-01T00:00:00.000Z", description="d" * 50)
+    comments = [f"{who}: " + "x" * 40 for who in ("a", "b", "c", "d")]
+
+    full = _render_content(item, "Issue", comments, max_chars=0)
+    capped = _render_content(item, "Issue", comments, max_chars=230)
+
+    assert len(full) > 230 and len(capped) <= 230
+    assert "a: " in capped and "b: " in capped
+    assert "d: " not in capped
+    assert capped.endswith("more comments omitted]")
+    assert "[2 more comments omitted]" in capped
+    # Pure function of its inputs: a capped item keeps its content-hash identity.
+    assert capped == _render_content(item, "Issue", list(comments), max_chars=230)
+
+
+def test_content_cap_truncates_an_oversized_description_and_skips_comments():
+    item = _item(1, iid=7, updated="2026-01-01T00:00:00.000Z", description="d" * 500)
+
+    capped = _render_content(item, "Issue", ["bob: hi"], max_chars=120)
+
+    assert len(capped) <= 120 + len("\n\n[1 comments omitted]")
+    assert "[description truncated:" in capped and "characters omitted]" in capped
+    assert capped.endswith("[1 comments omitted]")
+    assert "bob: hi" not in capped
+
+
+def test_sync_items_applies_the_content_cap_to_rows():
+    session = FakeGitLabSession(
+        {"issues": [_item(1, iid=7, updated="2026-01-01T00:00:00.000Z", description="body")]},
+        notes={("issues", 7): [_note("y" * 100, author=f"u{i}") for i in range(10)]},
+    )
+
+    rows, _ = _run(session, max_content_chars=300)
+
+    assert len(rows[0]["content"]) <= 300
+    assert "more comments omitted]" in rows[0]["content"]
+
+
 def test_unknown_kind_is_rejected():
     with pytest.raises(ValueError, match="unknown kind"):
         _run(FakeGitLabSession({}), kind="wikis")
@@ -375,6 +416,7 @@ def test_gitlab_source_reads_configuration_from_environment(monkeypatch):
     monkeypatch.setenv("GITLAB_PROJECT", "42")
     monkeypatch.setenv("GITLAB_URL", "https://git.internal/")
     monkeypatch.setenv("GITLAB_TOKEN", "glpat-test")
+    monkeypatch.setenv("GITLAB_MAX_CONTENT_CHARS", "0")
 
     source = gitlab_source(kinds=["issues"], session=object())
 
@@ -389,6 +431,8 @@ def test_gitlab_source_requires_project_and_known_kinds(monkeypatch):
         gitlab_source(session=object())
     with pytest.raises(ValueError, match="unknown kinds"):
         gitlab_source(project=PROJECT, kinds=["wikis"], session=object())
+    with pytest.raises(ValueError, match="max_content_chars"):
+        gitlab_source(project=PROJECT, max_content_chars=-1, session=object())
 
 
 # ---------------------------------------------------------------------------

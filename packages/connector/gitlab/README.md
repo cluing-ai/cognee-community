@@ -53,9 +53,10 @@ All from environment variables; nothing in code or in the repository.
 | `GITLAB_PROJECT` | yes | Project path (`group/name`) or numeric id |
 | `GITLAB_TOKEN` | for comments / private projects | Personal access token, `read_api` scope. Sent as `PRIVATE-TOKEN`; read-only |
 | `GITLAB_URL` | no | Instance URL, default `https://gitlab.com`. Set it for self-hosted instances |
+| `GITLAB_MAX_CONTENT_CHARS` | no | Cap on one rendered document, default `32000`; `0` = no cap. Header and description come first, comments are kept oldest-first while they fit, and the text ends with how many were left out. Keeps one 200-comment thread from setting the memory limit of the whole sync |
 
 Arguments to `gitlab_source(...)` override the environment: `project`, `base_url`, `token`,
-`kinds=("issues", "merge_requests")`, `include_comments=True`.
+`kinds=("issues", "merge_requests")`, `include_comments=True`, `max_content_chars=32000`.
 
 ## How sync and forget-on-delete work
 

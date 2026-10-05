@@ -77,6 +77,10 @@ KINDS: dict[str, tuple[str, str, str]] = {
 
 _PER_PAGE = 100
 _MAX_RETRIES = 5
+# Cap on one rendered document (header + description + comments). One issue with
+# a 200-comment thread must not dictate the memory limit of the whole sync:
+# GLiNER memory grows with the chunks of a single document. 0 = no cap.
+DEFAULT_MAX_CONTENT_CHARS = 32_000
 _RETRY_STATUSES = {429, 500, 502, 503, 504}
 _LINK_NEXT_RE = re.compile(r'<([^>]+)>;\s*rel="next"')
 
@@ -177,11 +181,19 @@ def _project_path(base_url: str, project: str) -> str:
     return f"{base_url}/api/v4/projects/{quote(str(project), safe='')}"
 
 
-def _render_content(item: dict, label: str, comments: list[str]) -> str:
+def _render_content(
+    item: dict, label: str, comments: list[str], max_chars: int = DEFAULT_MAX_CONTENT_CHARS
+) -> str:
     """Markdown document for one issue / merge request plus its comments.
 
     ``updated_at`` is deliberately left out so an untouched item renders the
     same text every run and keeps its content-hash identity in cognee.
+
+    ``max_chars`` bounds the whole text (0 = unbounded). The header and the
+    description have priority; comments are appended oldest first while they
+    fit, and a final line states how many were left out. Truncation is a pure
+    function of the inputs, so a capped item still renders identically from
+    run to run.
     """
     author = (item.get("author") or {}).get("username") or ""
     labels = ", ".join(item.get("labels") or [])
@@ -196,13 +208,42 @@ def _render_content(item: dict, label: str, comments: list[str]) -> str:
         header.append(f"Labels: {labels}")
     if item.get("source_branch"):
         header.append(f"Branches: {item.get('source_branch')} → {item.get('target_branch')}")
-    parts = ["\n".join(header), (item.get("description") or "").strip()]
-    if comments:
-        parts.append("Comments:\n\n" + "\n\n".join(comments))
-    return "\n\n".join(p for p in parts if p)
+    description = (item.get("description") or "").strip()
+    body = "\n\n".join(p for p in ("\n".join(header), description) if p)
+
+    if max_chars and len(body) > max_chars:
+        omitted = len(body) - max_chars
+        marker = f"\n\n[description truncated: {omitted} characters omitted]"
+        body = body[: max(0, max_chars - len(marker))] + marker
+        if comments:
+            body += f"\n\n[{len(comments)} comments omitted]"
+        return body
+
+    if not comments:
+        return body
+
+    kept: list[str] = []
+    used = len(body) + len("\n\nComments:")
+    for index, comment in enumerate(comments):
+        extra = len(comment) + 2  # "\n\n" separator
+        remaining_after = len(comments) - index - 1
+        # Keep room for the "omitted" line if this is not the last comment.
+        reserve = len(f"\n\n[{remaining_after} more comments omitted]") if remaining_after else 0
+        if max_chars and used + extra + reserve > max_chars:
+            kept.append(f"[{len(comments) - index} more comments omitted]")
+            break
+        kept.append(comment)
+        used += extra
+    return body + "\n\nComments:\n\n" + "\n\n".join(kept)
 
 
-def _item_to_row(item: dict, kind: str, project: str, comments: list[str]) -> dict[str, Any]:
+def _item_to_row(
+    item: dict,
+    kind: str,
+    project: str,
+    comments: list[str],
+    max_content_chars: int = DEFAULT_MAX_CONTENT_CHARS,
+) -> dict[str, Any]:
     label = KINDS[kind][2]
     return {
         "id": str(item.get("id")),
@@ -216,7 +257,7 @@ def _item_to_row(item: dict, kind: str, project: str, comments: list[str]) -> di
         "created_at": item.get("created_at") or "",
         "updated_at": item.get("updated_at") or "",
         "url": item.get("web_url") or "",
-        "content": _render_content(item, label, comments),
+        "content": _render_content(item, label, comments, max_content_chars),
         # Hard-delete marker (always False for live items). Vanished items are
         # emitted separately with _deleted=True.
         "_deleted": False,
@@ -255,6 +296,7 @@ def sync_items(
     state: dict,
     *,
     include_comments: bool = True,
+    max_content_chars: int = DEFAULT_MAX_CONTENT_CHARS,
 ) -> Iterator[dict[str, Any]]:
     """Yield changed items of one kind since the last run, plus delete markers.
 
@@ -293,7 +335,7 @@ def sync_items(
         comments = (
             _item_comments(session, project_url, kind, int(item["iid"])) if include_comments else []
         )
-        yield _item_to_row(item, kind, project, comments)
+        yield _item_to_row(item, kind, project, comments, max_content_chars)
         changed += 1
 
     # An empty sweep while items were previously known almost always means a
@@ -330,6 +372,7 @@ def gitlab_source(
     token: str | None = None,
     kinds: tuple[str, ...] | list[str] = ("issues", "merge_requests"),
     include_comments: bool = True,
+    max_content_chars: int | None = None,
     session: Any = None,
 ):
     """Return a ``dlt`` source that yields GitLab issues / merge requests.
@@ -342,6 +385,9 @@ def gitlab_source(
             ``GITLAB_TOKEN``. Optional for public projects, but comments need it.
         kinds: Any of ``"issues"``, ``"merge_requests"``.
         include_comments: Fold each item's non-system notes into its text.
+        max_content_chars: Cap on one rendered document; comments beyond it are
+            dropped with a count. Falls back to ``GITLAB_MAX_CONTENT_CHARS``,
+            then 32,000. ``0`` disables the cap.
         session: Pre-built ``requests`` session. Mainly an injection point for
             tests; when omitted one is built from ``token``.
 
@@ -361,6 +407,12 @@ def gitlab_source(
         raise ValueError("gitlab_source requires project= or GITLAB_PROJECT.")
     base_url = (base_url or os.environ.get("GITLAB_URL") or DEFAULT_BASE_URL).rstrip("/")
     token = token or os.environ.get("GITLAB_TOKEN")
+    if max_content_chars is None:
+        max_content_chars = int(
+            os.environ.get("GITLAB_MAX_CONTENT_CHARS") or DEFAULT_MAX_CONTENT_CHARS
+        )
+    if max_content_chars < 0:
+        raise ValueError("max_content_chars must be 0 (no cap) or a positive number.")
     unknown = [k for k in kinds if k not in KINDS]
     if unknown:
         raise ValueError(f"unknown kinds {unknown}; expected a subset of {sorted(KINDS)}")
@@ -386,6 +438,7 @@ def gitlab_source(
                 kind,
                 dlt.current.resource_state(),
                 include_comments=include_comments,
+                max_content_chars=max_content_chars,
             )
 
         return _items
