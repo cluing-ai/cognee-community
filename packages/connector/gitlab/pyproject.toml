@@ -5,15 +5,16 @@ description = "GitLab data-source connector for cognee — sync a project's issu
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 dependencies = [
-    # Document-mode dlt sources (DOCUMENT_SOURCE_ATTR routing) shipped in cognee
-    # 1.4.0; 1.6.x is the current release the Docker image is built from.
+    # Needs cognee 1.6: document-mode dlt sources (DOCUMENT_SOURCE_ATTR) plus the
+    # per-source pipeline scope (PIPELINE_SCOPE_ATTR) that keeps our state separate.
     "cognee>=1.6.0,<2",
-    "dlt[sqlalchemy]>=1.9.0,<2",
+    "dlt>=1.9.0,<2",
     "requests>=2.31.0,<3",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.6"]
+# The sqlalchemy destination is only used by the end-to-end test (SQLite).
+dev = ["pytest>=8", "ruff>=0.6", "dlt[sqlalchemy]>=1.9.0,<2"]
 
 [project.urls]
 Homepage = "https://github.com/topoteretes/cognee"

@@ -11,7 +11,6 @@ The source is handed straight to :func:`cognee.remember`::
         dataset_name="my_gitlab",
         primary_key="id",
         write_disposition="merge",   # incremental upsert by GitLab id
-        max_rows_per_table=0,        # 0 = no row cap (see note below)
     )
 
 Design
@@ -33,7 +32,22 @@ Design
   their comments fetched and are emitted. The cursor and the id set live in
   dlt's per-resource state, so re-running ``remember`` resumes where it left off.
   GitLab timestamps are ISO-8601 UTC strings of fixed shape, so they compare
-  as strings.
+  as strings. Known window: an item written in the same second as the cursor,
+  after its page was read, is skipped on the next run until it changes again
+  (second-granularity timestamps; the alternative, re-fetching ties every run,
+  would make a no-change run emit rows, which the deployment proof relies on).
+* **Listing order** — ``order_by=created_at``, ascending. Offset pagination over
+  a key that changes while listing (``updated_at``) lets an edited item move
+  between pages; ``created_at`` is append-only, so every live item is seen
+  exactly once per sweep and deletion detection cannot misfire. gitlab.com caps
+  offset pagination at 50,000 items per listing ``[unverified: GitLab docs,
+  REST API pagination]``; projects beyond that need keyset pagination, which
+  is not enabled here because older self-hosted instances reject it.
+* **Own pipeline state** — the source carries cognee's ``cognee_pipeline_scope``
+  marker (``gitlab:<base_url>:<project>``), so two projects or two instances in
+  two datasets never share a cursor or a known-id set; without it every unscoped
+  dlt source shares one pipeline name and alternating runs would refetch
+  everything and emit spurious deletes.
 * **Forget-on-delete** — GitLab has no deletion feed, so the listing above
   doubles as an id sweep against the previous run's ids. Items that vanished are
   emitted with the ``_deleted`` hard-delete marker; dlt removes those rows on
@@ -41,42 +55,56 @@ Design
   and relational stores. **Closed is not deleted**: closed and merged items are
   listed with ``state=all`` and stay in memory with their new state.
 * **Comments** — non-system notes are folded into their parent's text, like the
-  Confluence connector folds footer comments. One document per discussion.
+  Confluence connector folds footer comments. One document per discussion. A
+  new note moves the parent's ``updated_at`` ``[unverified against a live
+  instance; the API docs do not state it]``; an edited or deleted note may not,
+  so such a change reaches memory only when the parent is next touched.
 * **Rate limits** — 429 and 5xx responses are retried, honouring ``Retry-After``
-  and ``RateLimit-Reset``; any other HTTP error aborts the run. An aborted run
-  leaves staging and memory untouched, which is the safe failure: a partial
-  listing must never drive deletions.
-
-.. note::
-   cognee reads at most ``max_rows_per_table`` rows back from the dlt
-   destination (default 0 = unlimited in current releases). Keep it at 0 so
-   orphan cleanup compares against the whole synced corpus.
+  (seconds or HTTP-date) and ``RateLimit-Reset``, each wait capped at 60 s,
+  five attempts in total; any other HTTP error, or the fifth retryable one,
+  aborts the run. An aborted run leaves staging and memory untouched, which is
+  the safe failure: a partial listing must never drive deletions.
 """
 
 from __future__ import annotations
 
+import email.utils
 import os
 import re
 import time
 from collections.abc import Iterator
-from typing import Any
+from datetime import UTC
+from typing import Any, NamedTuple
 
+import dlt
+import requests
 from cognee.shared.logging_utils import get_logger
-from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
+from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR, PIPELINE_SCOPE_ATTR
 
 logger = get_logger("gitlab_connector")
 
 GITLAB_SOURCE_NAME = "gitlab"
 DEFAULT_BASE_URL = "https://gitlab.com"
 
-# Supported item kinds → (API path segment, dlt table name, human label).
-KINDS: dict[str, tuple[str, str, str]] = {
-    "issues": ("issues", "gitlab_issues", "Issue"),
-    "merge_requests": ("merge_requests", "gitlab_merge_requests", "Merge request"),
+
+class Kind(NamedTuple):
+    """One supported item kind: API path segment, dlt table name, human label."""
+
+    path: str
+    table: str
+    label: str
+
+
+KINDS: dict[str, Kind] = {
+    "issues": Kind("issues", "gitlab_issues", "Issue"),
+    "merge_requests": Kind("merge_requests", "gitlab_merge_requests", "Merge request"),
 }
 
 _PER_PAGE = 100
 _MAX_RETRIES = 5
+# Longest single wait between retries. A server-sent ``Retry-After: 3600`` must not park
+# the sync for an hour inside a generator; the run aborts after _MAX_RETRIES instead.
+_MAX_RETRY_DELAY = 60.0
 # Cap on one rendered document (header + description + comments). One issue with
 # a 200-comment thread must not dictate the memory limit of the whole sync:
 # GLiNER memory grows with the chunks of a single document. 0 = no cap.
@@ -84,22 +112,12 @@ DEFAULT_MAX_CONTENT_CHARS = 32_000
 _RETRY_STATUSES = {429, 500, 502, 503, 504}
 _LINK_NEXT_RE = re.compile(r'<([^>]+)>;\s*rel="next"')
 
-_EXTRA_HINT = (
-    "The GitLab connector requires dlt and requests: "
-    'pip install "cognee-community-connector-gitlab".'
-)
-
 
 # ---------------------------------------------------------------------------
 # HTTP helpers
 # ---------------------------------------------------------------------------
 def _make_session(token: str | None) -> Any:
     """Build a ``requests`` session; the token is optional for public reads."""
-    try:
-        import requests
-    except ImportError as exc:  # pragma: no cover - depends on install
-        raise ImportError(_EXTRA_HINT) from exc
-
     session = requests.Session()
     session.headers.update({"Accept": "application/json"})
     if token:
@@ -107,20 +125,32 @@ def _make_session(token: str | None) -> Any:
     return session
 
 
-def _retry_delay(headers: Any, attempt: int) -> float:
-    """Seconds to wait: ``Retry-After``, else time until ``RateLimit-Reset``, else backoff."""
+def _retry_delay(headers: Any, attempt: int, *, now: float | None = None) -> float:
+    """Seconds to wait, capped at ``_MAX_RETRY_DELAY``.
+
+    ``Retry-After`` as seconds or as an HTTP-date (RFC 7231 allows both), else
+    the time until ``RateLimit-Reset`` (epoch seconds), else ``2**attempt``.
+    """
     headers = headers or {}
+    now = time.time() if now is None else now
     retry_after = headers.get("Retry-After") or headers.get("retry-after")
-    try:
-        return max(0.0, float(retry_after))
-    except (TypeError, ValueError):
-        pass
+    if retry_after is not None:
+        try:
+            return min(_MAX_RETRY_DELAY, max(0.0, float(retry_after)))
+        except (TypeError, ValueError):
+            try:
+                when = email.utils.parsedate_to_datetime(str(retry_after))
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=UTC)
+                return min(_MAX_RETRY_DELAY, max(0.0, when.timestamp() - now))
+            except (TypeError, ValueError):
+                pass
     reset = headers.get("RateLimit-Reset") or headers.get("ratelimit-reset")
     try:
-        return max(0.0, float(reset) - time.time())
+        return min(_MAX_RETRY_DELAY, max(0.0, float(reset) - now))
     except (TypeError, ValueError):
         pass
-    return float(2**attempt)
+    return min(_MAX_RETRY_DELAY, float(2**attempt))
 
 
 def _api_get(session: Any, url: str, params: dict | None = None, *, sleep=time.sleep) -> Any:
@@ -131,9 +161,9 @@ def _api_get(session: Any, url: str, params: dict | None = None, *, sleep=time.s
     """
     for attempt in range(_MAX_RETRIES):
         response = session.get(url, params=params or {})
-        status = getattr(response, "status_code", 200)
+        status = response.status_code
         if status in _RETRY_STATUSES and attempt < _MAX_RETRIES - 1:
-            delay = _retry_delay(getattr(response, "headers", None), attempt)
+            delay = _retry_delay(response.headers, attempt)
             logger.warning(
                 "GitLab: HTTP %s on %s — retrying in %.1fs (%d/%d).",
                 status,
@@ -151,7 +181,7 @@ def _api_get(session: Any, url: str, params: dict | None = None, *, sleep=time.s
 
 def _next_link(response: Any) -> str | None:
     """Return the ``rel="next"`` URL from the ``Link`` header, if any."""
-    link = (getattr(response, "headers", None) or {}).get("Link") or ""
+    link = (response.headers or {}).get("Link") or ""
     match = _LINK_NEXT_RE.search(link)
     return match.group(1) if match else None
 
@@ -186,14 +216,17 @@ def _render_content(
 ) -> str:
     """Markdown document for one issue / merge request plus its comments.
 
-    ``updated_at`` is deliberately left out so an untouched item renders the
-    same text every run and keeps its content-hash identity in cognee.
+    ``updated_at`` is deliberately left out of the text: cognee derives the
+    document identity from the whole row's content hash, so what matters is
+    that unchanged text stays byte-identical and is never re-chunked or
+    re-cognified for a timestamp-only change.
 
-    ``max_chars`` bounds the whole text (0 = unbounded). The header and the
-    description have priority; comments are appended oldest first while they
-    fit, and a final line states how many were left out. Truncation is a pure
-    function of the inputs, so a capped item still renders identically from
-    run to run.
+    ``max_chars`` bounds the whole text (0 = unbounded) exactly: the rendered
+    string is never longer than ``max_chars``, and a document that fits is
+    never cut. The header and the description have priority; the largest
+    prefix of comments (oldest first) that fits together with the closing
+    "omitted" line is kept. Truncation is a pure function of the inputs, so a
+    capped item still renders identically from run to run.
     """
     author = (item.get("author") or {}).get("username") or ""
     labels = ", ".join(item.get("labels") or [])
@@ -211,30 +244,43 @@ def _render_content(
     description = (item.get("description") or "").strip()
     body = "\n\n".join(p for p in ("\n".join(header), description) if p)
 
-    if max_chars and len(body) > max_chars:
+    if not max_chars:
+        return body + ("\n\nComments:\n\n" + "\n\n".join(comments) if comments else "")
+
+    def _omitted_line(count: int) -> str:
+        return f"\n\n[{count} more comments omitted]" if count else ""
+
+    if len(body) > max_chars:
+        tail = f"\n\n[{len(comments)} comments omitted]" if comments else ""
+        marker = "\n\n[description truncated: {omitted} characters omitted]"
+        # The marker's own length depends on the digit count; two passes settle it.
         omitted = len(body) - max_chars
-        marker = f"\n\n[description truncated: {omitted} characters omitted]"
-        body = body[: max(0, max_chars - len(marker))] + marker
-        if comments:
-            body += f"\n\n[{len(comments)} comments omitted]"
-        return body
+        for _ in range(2):
+            text = marker.format(omitted=omitted)
+            keep = max(0, max_chars - len(text) - len(tail))
+            omitted = len(body) - keep
+        return body[:keep] + marker.format(omitted=omitted) + tail
 
     if not comments:
         return body
 
-    kept: list[str] = []
-    used = len(body) + len("\n\nComments:")
-    for index, comment in enumerate(comments):
-        extra = len(comment) + 2  # "\n\n" separator
-        remaining_after = len(comments) - index - 1
-        # Keep room for the "omitted" line if this is not the last comment.
-        reserve = len(f"\n\n[{remaining_after} more comments omitted]") if remaining_after else 0
-        if max_chars and used + extra + reserve > max_chars:
-            kept.append(f"[{len(comments) - index} more comments omitted]")
+    # Largest k such that body + "Comments:" + the first k comments + the
+    # omitted line for the rest fits in max_chars. Cumulative lengths make
+    # this a single backwards scan.
+    head = body + "\n\nComments:"
+    cumulative = [0]
+    for comment in comments:
+        cumulative.append(cumulative[-1] + len("\n\n") + len(comment))
+    for k in range(len(comments), -1, -1):
+        total = len(head) + cumulative[k] + len(_omitted_line(len(comments) - k))
+        if total <= max_chars:
             break
-        kept.append(comment)
-        used += extra
-    return body + "\n\nComments:\n\n" + "\n\n".join(kept)
+    kept = comments[:k]
+    rendered = head + "".join("\n\n" + c for c in kept) + _omitted_line(len(comments) - k)
+    if k == 0 and len(rendered) > max_chars:
+        # Not even the omitted line fits after the body: the body wins, nothing else.
+        return body
+    return rendered
 
 
 def _item_to_row(
@@ -244,7 +290,7 @@ def _item_to_row(
     comments: list[str],
     max_content_chars: int = DEFAULT_MAX_CONTENT_CHARS,
 ) -> dict[str, Any]:
-    label = KINDS[kind][2]
+    label = KINDS[kind].label
     return {
         "id": str(item.get("id")),
         "iid": int(item.get("iid") or 0),
@@ -271,7 +317,7 @@ def _deleted_row(item_id: str) -> dict[str, Any]:
 
 def _item_comments(session: Any, project_url: str, kind: str, iid: int) -> list[str]:
     """Non-system notes of one item, oldest first, as ``author: text`` lines."""
-    path = KINDS[kind][0]
+    path = KINDS[kind].path
     texts: list[str] = []
     for note in _paginate(
         session, f"{project_url}/{path}/{iid}/notes", {"sort": "asc", "order_by": "created_at"}
@@ -317,10 +363,12 @@ def sync_items(
     current_ids: set[str] = set()
     changed = 0
 
+    # created_at is append-only: an edit while listing cannot move an item across a
+    # page boundary, so the sweep sees every live item exactly once (see module docs).
     for item in _paginate(
         session,
         f"{project_url}/{path}",
-        {"state": "all", "order_by": "updated_at", "sort": "asc"},
+        {"state": "all", "order_by": "created_at", "sort": "asc"},
     ):
         item_id = str(item["id"])
         current_ids.add(item_id)
@@ -395,13 +443,9 @@ def gitlab_source(
         A ``dlt`` source named ``gitlab`` with one resource per kind
         (``gitlab_issues``, ``gitlab_merge_requests``), each configured with
         ``primary_key="id"``, ``write_disposition="merge"`` and a ``_deleted``
-        hard-delete column, and tagged as a cognee document source.
+        hard-delete column, tagged as a cognee document source with its own
+        pipeline scope.
     """
-    try:
-        import dlt
-    except ImportError as exc:
-        raise ImportError(_EXTRA_HINT) from exc
-
     project = project or os.environ.get("GITLAB_PROJECT")
     if not project:
         raise ValueError("gitlab_source requires project= or GITLAB_PROJECT.")
@@ -418,7 +462,7 @@ def gitlab_source(
         raise ValueError(f"unknown kinds {unknown}; expected a subset of {sorted(KINDS)}")
 
     def _make_resource(kind: str):
-        table = KINDS[kind][1]
+        table = KINDS[kind].table
 
         @dlt.resource(
             name=table,
@@ -451,4 +495,8 @@ def gitlab_source(
     # Opt into the document ingestion path (item → text document → cognify).
     # resolve_dlt_sources reads this marker; it never imports this connector.
     setattr(source, DOCUMENT_SOURCE_ATTR, GITLAB_SOURCE_NAME)
+    # Own dlt pipeline per (dataset, instance, project): cognee derives the pipeline
+    # name from this scope, so the cursor and known-id set of this project cannot be
+    # overwritten by another dlt source or another project run in between.
+    setattr(source, PIPELINE_SCOPE_ATTR, f"{GITLAB_SOURCE_NAME}:{base_url}:{project}")
     return source
