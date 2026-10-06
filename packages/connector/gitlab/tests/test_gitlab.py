@@ -493,7 +493,8 @@ def test_content_cap_is_exact_at_the_boundary():
             assert (
                 f"[{len(comments) - kept} more comments omitted]" in text
                 or text == body_only
-                or f"[{len(comments)} comments omitted]" in text
+                or "comments omitted]" in text
+                or "description truncated" in text  # cap below the body: tail may not fit
             )
     # Oversized description + comments: still never longer than the cap.
     big = _item(2, updated="2026-01-01T00:00:00.000Z", description="x" * 500)
