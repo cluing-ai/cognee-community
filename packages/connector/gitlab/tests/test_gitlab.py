@@ -32,12 +32,19 @@ import json
 from urllib.parse import parse_qs, urlparse
 
 import pytest
+from cognee.tasks.ingestion.dlt_utils import (
+    DOCUMENT_SOURCE_ATTR,
+    PIPELINE_SCOPE_ATTR,
+    pipeline_name_for_source,
+)
 
 from cognee_community_connector_gitlab.gitlab import (
+    _MAX_RETRY_DELAY,
     GITLAB_SOURCE_NAME,
     _api_get,
     _paginate,
     _render_content,
+    _retry_delay,
     gitlab_source,
     sync_items,
 )
@@ -50,16 +57,18 @@ PROJECT_URL = f"{BASE_URL}/api/v4/projects/group%2Fdemo"
 # ---------------------------------------------------------------------------
 # Fake GitLab REST API
 # ---------------------------------------------------------------------------
-def _item(item_id, *, iid=None, updated, title="", state="opened", description="", **extra):
+def _item(
+    item_id, *, iid=None, updated, created=None, title="", state="opened", description="", **extra
+):
     row = {
         "id": item_id,
         "iid": iid or item_id,
+        "created_at": created or "2025-01-01T00:00:00.000Z",
         "title": title or f"Item {item_id}",
         "state": state,
         "description": description,
         "labels": extra.pop("labels", []),
         "author": {"username": extra.pop("author", "alice")},
-        "created_at": "2026-01-01T00:00:00.000Z",
         "updated_at": updated,
         "web_url": f"{BASE_URL}/{PROJECT}/-/issues/{iid or item_id}",
     }
@@ -89,15 +98,20 @@ class FakeGitLabSession:
     """Minimal stand-in for a ``requests`` session hitting GitLab v4.
 
     ``items``: {kind: [item, ...]}; ``notes``: {(kind, iid): [note, ...]}.
-    ``page_size`` splits listings into Link-paginated pages. ``fail`` is a list
-    of ``(status, headers)`` responses to return first, for retry tests.
+    ``page_size`` splits listings into Link-paginated pages, honouring the
+    ``order_by``/``sort`` query like the real server (offset pagination over the
+    *current* ordering, so edits between pages shift boundaries exactly as on
+    gitlab.com). ``fail`` is a list of ``(status, headers)`` responses to return
+    first, for retry tests. ``between_pages(page)`` is called after each listing
+    page is served, so a test can edit the corpus mid-listing.
     """
 
-    def __init__(self, items, notes=None, *, page_size=100, fail=None):
+    def __init__(self, items, notes=None, *, page_size=100, fail=None, between_pages=None):
         self.items = items
         self.notes = notes or {}
         self.page_size = page_size
         self.fail = list(fail or [])
+        self.between_pages = between_pages
         self.calls: list[tuple[str, dict]] = []
 
     def get(self, url, params=None):
@@ -118,13 +132,23 @@ class FakeGitLabSession:
             iid = int(parts[-2])
             return _Resp(self.notes.get((kind, iid), []))
         kind = parts[-1]
-        rows = self.items.get(kind, [])
+        order_by = query.get("order_by", "created_at")
+        rows = sorted(
+            self.items.get(kind, []),
+            key=lambda r: r.get(order_by) or "",
+            reverse=query.get("sort", "desc") == "desc",
+        )
         page = int(query.get("page", 1))
         size = self.page_size  # the server caps per_page; the client cannot raise it
-        chunk = rows[(page - 1) * size : page * size]
+        chunk = [dict(r) for r in rows[(page - 1) * size : page * size]]
         headers = {}
         if page * size < len(rows):
-            headers["Link"] = f'<{PROJECT_URL}/{kind}?page={page + 1}&per_page={size}>; rel="next"'
+            nxt = f"{PROJECT_URL}/{kind}?page={page + 1}&per_page={size}"
+            if "order_by" in query:
+                nxt += f"&order_by={order_by}&sort={query.get('sort', 'desc')}"
+            headers["Link"] = f'<{nxt}>; rel="next"'
+        if self.between_pages:
+            self.between_pages(page)
         return _Resp(chunk, headers=headers)
 
 
@@ -173,6 +197,65 @@ def test_non_retryable_http_error_aborts_the_sync():
 
     with pytest.raises(RuntimeError, match="HTTP 401"):
         _run(session)
+
+
+def test_five_consecutive_server_errors_abort_instead_of_sleeping_forever():
+    slept = []
+    session = FakeGitLabSession(
+        {"issues": [_item(1, updated="2026-01-01T00:00:00.000Z")]},
+        fail=[(503, {"Retry-After": "3600"})] * 5,
+    )
+
+    with pytest.raises(RuntimeError, match="HTTP 503"):
+        _api_get(session, f"{PROJECT_URL}/issues", {}, sleep=slept.append)
+    assert len(session.calls) == 5  # four retries, then the fifth answer is raised
+    assert slept == [_MAX_RETRY_DELAY] * 4  # an hour-long Retry-After is capped, not obeyed
+
+
+def test_retry_delay_is_capped_and_parses_http_dates():
+    now = 1_800_000_000.0
+    assert _retry_delay({"Retry-After": "3600"}, 0, now=now) == _MAX_RETRY_DELAY
+    assert _retry_delay({"Retry-After": "7"}, 0, now=now) == 7.0
+    # RFC 7231 HTTP-date form: 30 s in the future from `now`.
+    import email.utils
+
+    date = email.utils.formatdate(now + 30, usegmt=True)
+    assert 29.0 <= _retry_delay({"Retry-After": date}, 0, now=now) <= 30.0
+    assert (
+        _retry_delay({"Retry-After": "not a date"}, 3, now=now) == 8.0
+    )  # falls back to 2**attempt
+    assert _retry_delay({"RateLimit-Reset": str(int(now) + 90)}, 0, now=now) == _MAX_RETRY_DELAY
+    assert _retry_delay({}, 10, now=now) == _MAX_RETRY_DELAY
+
+
+def test_edit_between_pages_causes_no_false_delete_under_created_at_order():
+    """Offset pagination over a moving key loses or duplicates items; created_at is append-only."""
+    items = [
+        _item(i, updated=f"2026-01-0{i}T00:00:00.000Z", created=f"2026-01-0{i}T00:00:00.000Z")
+        for i in range(1, 6)
+    ]
+    state: dict = {}
+    _run(FakeGitLabSession({"issues": [dict(i) for i in items]}, page_size=2), state)
+    assert state["known_ids"] == ["1", "2", "3", "4", "5"]
+
+    def edit_item_3_after_first_page(page):
+        if page == 1:
+            items[2]["updated_at"] = (
+                "2026-02-01T00:00:00.000Z"  # moves to the tail under updated_at order
+            )
+
+    session = FakeGitLabSession(
+        {"issues": items}, page_size=2, between_pages=edit_item_3_after_first_page
+    )
+    rows, state = _run(session, state)
+    assert [r["id"] for r in rows if not r.get("_deleted")] == ["3"]  # the edited item, once
+    assert [r["id"] for r in rows if r.get("_deleted")] == []  # nobody falsely tombstoned
+    assert state["known_ids"] == ["1", "2", "3", "4", "5"]
+    assert all(
+        c[1].get("order_by", "created_at") == "created_at" or "order_by=created_at" in c[0]
+        for c in session.calls
+        if "/issues" in c[0] and "notes" not in c[0]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -388,6 +471,36 @@ def test_sync_items_applies_the_content_cap_to_rows():
     assert "more comments omitted]" in rows[0]["content"]
 
 
+def test_content_cap_is_exact_at_the_boundary():
+    item = _item(1, updated="2026-01-01T00:00:00.000Z", description="d" * 40)
+    comments = [f"bob: {'c' * 20}" for _ in range(6)]
+    full = _render_content(item, "Issue", comments, max_chars=0)
+    # A document of exactly max_chars is not truncated.
+    assert _render_content(item, "Issue", comments, max_chars=len(full)) == full
+    # Every cap below that renders at most max_chars and keeps the longest fitting prefix.
+    previous_kept = None
+    for cap in range(len(full) - 1, len(full) - 200, -1):
+        text = _render_content(item, "Issue", comments, max_chars=cap)
+        assert len(text) <= cap, cap
+        kept = text.count("bob:")
+        if previous_kept is not None:
+            assert kept <= previous_kept  # monotone: a tighter cap never keeps more
+        previous_kept = kept
+        if kept < len(comments):
+            # Either the omitted line fits, or not even that fits and the body alone is kept.
+            # (or the cap is below the body itself, and the description-truncation path ran).
+            body_only = _render_content(item, "Issue", [], max_chars=0)
+            assert (
+                f"[{len(comments) - kept} more comments omitted]" in text
+                or text == body_only
+                or f"[{len(comments)} comments omitted]" in text
+            )
+    # Oversized description + comments: still never longer than the cap.
+    big = _item(2, updated="2026-01-01T00:00:00.000Z", description="x" * 500)
+    text = _render_content(big, "Issue", comments, max_chars=120)
+    assert len(text) <= 120 and "description truncated" in text and "6 comments omitted" in text
+
+
 def test_unknown_kind_is_rejected():
     with pytest.raises(ValueError, match="unknown kind"):
         _run(FakeGitLabSession({}), kind="wikis")
@@ -399,11 +512,17 @@ def test_unknown_kind_is_rejected():
 def test_gitlab_source_declares_document_marker_merge_and_hard_delete():
     from cognee.tasks.ingestion.dlt_utils import document_source_tag
 
-    source = gitlab_source(project=PROJECT, session=object())
+    source = gitlab_source(project=PROJECT, base_url=BASE_URL, session=object())
 
     assert document_source_tag(source) == GITLAB_SOURCE_NAME == "gitlab"
     resources = source.resources
     assert set(resources) == {"gitlab_issues", "gitlab_merge_requests"}
+    assert getattr(source, DOCUMENT_SOURCE_ATTR) == GITLAB_SOURCE_NAME
+    # Own pipeline scope per instance + project: two projects never share cursor or known ids.
+    assert getattr(source, PIPELINE_SCOPE_ATTR) == f"gitlab:{BASE_URL}:{PROJECT}"
+    assert pipeline_name_for_source(source, "ds") != "ingest_dlt_source"
+    other = gitlab_source(project="group/other", base_url=BASE_URL, session=object())
+    assert pipeline_name_for_source(source, "ds") != pipeline_name_for_source(other, "ds")
     for name in resources:
         table = resources[name].compute_table_schema()
         assert table["write_disposition"] == "merge"
@@ -412,17 +531,22 @@ def test_gitlab_source_declares_document_marker_merge_and_hard_delete():
         assert table["columns"]["_deleted"]["data_type"] == "bool"
 
 
-def test_gitlab_source_reads_configuration_from_environment(monkeypatch):
+def test_gitlab_source_reads_configuration_from_environment(monkeypatch, tmp_path):
     monkeypatch.setenv("GITLAB_PROJECT", "42")
     monkeypatch.setenv("GITLAB_URL", "https://git.internal/")
     monkeypatch.setenv("GITLAB_TOKEN", "glpat-test")
     monkeypatch.setenv("GITLAB_MAX_CONTENT_CHARS", "0")
+    dlt = pytest.importorskip("dlt")
+    fake = FakeGitLabSession({"issues": [_item(1, updated="2026-01-01T00:00:00.000Z")]})
 
-    source = gitlab_source(kinds=["issues"], session=object())
-
+    source = gitlab_source(kinds=["issues"], session=fake)
     assert list(source.resources) == ["gitlab_issues"]
     # The token is never part of the source object (it only lives in the session).
     assert "glpat-test" not in json.dumps(source.discover_schema().to_dict(), default=str)
+    # The configured URL and project are *used*: the first request goes to them.
+    _pipeline(dlt, tmp_path).run(source, write_disposition="merge", primary_key="id")
+    assert fake.calls[0][0] == "https://git.internal/api/v4/projects/42/issues"
+    assert getattr(source, PIPELINE_SCOPE_ATTR) == "gitlab:https://git.internal:42"
 
 
 def test_gitlab_source_requires_project_and_known_kinds(monkeypatch):
