@@ -25,10 +25,13 @@ from cognee_community_connector_gitlab import gitlab_source
 
 DATASET_NAME = "gitlab_project"
 
-# Routing kwargs shared by every remember() call. max_rows_per_table=0 keeps
+# Routing kwargs shared by every remember() call: merge by GitLab id so a second run
 # cognee reading the whole staging table, so forget-on-delete compares against
 # the entire synced corpus.
-REMEMBER_KWARGS = {"primary_key": "id", "write_disposition": "merge", "max_rows_per_table": 0}
+REMEMBER_KWARGS = {
+    "primary_key": "id",
+    "write_disposition": "merge",
+}
 
 
 async def main():

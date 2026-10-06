@@ -29,7 +29,6 @@ await cognee.remember(
     dataset_name="gitlab_project",
     primary_key="id",
     write_disposition="merge",  # incremental upsert by GitLab id
-    max_rows_per_table=0,  # unlimited: orphan-cleanup sees the whole corpus
 )
 
 results = await cognee.recall(
@@ -71,11 +70,18 @@ Arguments to `gitlab_source(...)` override the environment: `project`, `base_url
   `merge` and cognee's `orphan_cleanup` removes them from the graph, vector and relational
   stores. **Closed or merged is not deleted** — those items stay in memory with their new
   state. An empty sweep while items were known is treated as a failed listing, not a wipe.
-- **Comments**: non-system notes are folded into their parent's text, oldest first. GitLab
-  bumps the parent's `updated_at` when a note is added, so comments ride the parent's cursor.
-- **Rate limits and pagination**: `Link: rel="next"` is followed; 429/5xx are retried
-  honouring `Retry-After` and `RateLimit-Reset`; any other HTTP error aborts the run so a
-  partial listing never drives deletions.
+- **Comments**: non-system notes are folded into their parent's text, oldest first. A new note
+  moves the parent's `updated_at` `[unverified against a live instance; the API docs do not state
+  it]`, so comments ride the parent's cursor; an edited or deleted note may not, and then reaches
+  memory only when the parent is next touched. The Confluence connector has the same caveat.
+- **Rate limits and pagination**: `Link: rel="next"` is followed; listings are ordered by
+  `created_at` (append-only, so an edit mid-listing cannot hide an item from the sweep);
+  429/5xx are retried honouring `Retry-After` (seconds or HTTP-date) and `RateLimit-Reset`, each
+  wait capped at 60 s, five attempts; any other HTTP error aborts the run so a partial listing
+  never drives deletions. gitlab.com caps offset pagination at 50,000 items per listing
+  `[unverified]`; keyset pagination is not enabled because older self-hosted instances reject it.
+- **Own pipeline state**: the source carries cognee's `cognee_pipeline_scope` marker
+  (`gitlab:<url>:<project>`), so two projects in two datasets never share a cursor or id set.
 - **Document mode**: the source declares `cognee_document_source = "gitlab"`, so each row is
   ingested as a text document (`# {title}\n\n{content}`) through normal cognify, with
   `url` and `id` kept in metadata.
