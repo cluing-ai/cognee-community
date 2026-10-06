@@ -253,13 +253,18 @@ def _render_content(
     if len(body) > max_chars:
         tail = f"\n\n[{len(comments)} comments omitted]" if comments else ""
         marker = "\n\n[description truncated: {omitted} characters omitted]"
-        # The marker's own length depends on the digit count; two passes settle it.
-        omitted = len(body) - max_chars
-        for _ in range(2):
-            text = marker.format(omitted=omitted)
-            keep = max(0, max_chars - len(text) - len(tail))
-            omitted = len(body) - keep
-        return body[:keep] + marker.format(omitted=omitted) + tail
+        # Prefer body + marker + tail; if the cap is too small for the tail, drop it; if it is
+        # too small even for the marker, the hard cut wins. Never longer than max_chars.
+        for suffix in (tail, ""):
+            omitted = len(body) - max_chars
+            for _ in range(2):  # the marker's own length depends on the digit count
+                text = marker.format(omitted=omitted)
+                keep = max(0, max_chars - len(text) - len(suffix))
+                omitted = len(body) - keep
+            candidate = body[:keep] + marker.format(omitted=omitted) + suffix
+            if len(candidate) <= max_chars and keep > 0:
+                return candidate
+        return body[:max_chars]
 
     if not comments:
         return body
