@@ -251,11 +251,10 @@ def test_edit_between_pages_causes_no_false_delete_under_created_at_order():
     assert [r["id"] for r in rows if not r.get("_deleted")] == ["3"]  # the edited item, once
     assert [r["id"] for r in rows if r.get("_deleted")] == []  # nobody falsely tombstoned
     assert state["known_ids"] == ["1", "2", "3", "4", "5"]
-    assert all(
-        c[1].get("order_by", "created_at") == "created_at" or "order_by=created_at" in c[0]
-        for c in session.calls
-        if "/issues" in c[0] and "notes" not in c[0]
-    )
+    listing_calls = [c for c in session.calls if "/issues" in c[0] and "notes" not in c[0]]
+    assert listing_calls[0][1].get("order_by") == "created_at"  # first request carries the params
+    assert listing_calls[0][1].get("sort") == "asc"
+    assert all("order_by=created_at" in c[0] for c in listing_calls[1:])  # next links keep it
 
 
 # ---------------------------------------------------------------------------
